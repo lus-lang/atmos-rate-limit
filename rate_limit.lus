@@ -1,0 +1,499 @@
+--- Limits how many requests each client may make.
+---
+--- A limiter counts requests per key with a fixed window, a sliding window,
+--- or a token bucket, and reports whether a request is allowed, how many
+--- remain, and when to retry. Registered on a `web` scope, the package
+--- applies a limiter to the scope: it sets the `RateLimit-Limit`, `RateLimit-Remaining`, and
+--- `RateLimit-Reset` headers and answers a request over the limit with 429
+--- and `Retry-After`.
+---
+--- Counters live in a store. `rate_limit.memory` keeps them in the
+--- process. Any table with the three methods below works in its place, so
+--- that several processes can share their counters through a database.
+---
+--- - `store:incr(key, ttl, amount)` adds `amount` to the counter at `key`
+---   and returns the new count and the seconds until the counter expires.
+---   A key that is absent or expired starts from 0 and expires `ttl`
+---   seconds later. An increment of a live counter keeps its expiry.
+--- - `store:get(key)` returns the number at `key`, or nil when the key is
+---   absent or expired.
+--- - `store:set(key, value, ttl)` stores a number that expires after `ttl`
+---   seconds.
+---
+--- A store method may suspend the coroutine that calls it, as a network
+--- client does inside `network.serve`. The token bucket reads a key with
+--- `get` and writes it with `set`. When a store suspends between the two,
+--- requests that arrive together may each read the same state and take
+--- the same token. A store closes that gap with a fourth, optional method
+--- that does both steps as one operation, which the limiter uses when it
+--- is present.
+---
+--- - `store:take(key, cost, interval, burst, now)` takes `cost` tokens
+---   from the bucket at `key`. `interval` is the seconds one token takes
+---   to refill, `burst` the capacity in tokens, and `now` the time in
+---   seconds. The number stored at `key` is the time at which the bucket
+---   is full again, and a missing key or a time before `now` means a full
+---   bucket. When that time plus `cost * interval` lies at most
+---   `burst * interval` after `now`, the method stores the sum with a
+---   lifetime that ends at the sum and returns true and the seconds from
+---   `now` to the sum. Otherwise it stores nothing and returns false and
+---   the seconds from `now` to the time it read. A database store runs
+---   these steps as one script.
+---
+--- @package rate_limit
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-rate-limit
+
+local M = {}
+
+local type, tostring, pairs, next, setmetatable = type, tostring, pairs, next, setmetatable
+local floor, ceil, max_of = math.floor, math.ceil, math.max
+local time_now = time.now
+
+-- The wall clock in seconds, as a float.
+local function wall_clock()
+    local n = time_now()
+    return n:epoch() + n:nanos() / 1e9
+end
+
+-- Absorbs the rounding of float arithmetic on token counts.
+local EPSILON = 1e-9
+
+-- The token bucket stores one number per key, the time at which the bucket
+-- is full again. A request moves that time forward by the time its tokens
+-- take to refill. Returns whether the request fits and the seconds until
+-- the bucket is full, after the request when it fits.
+local function bucket_step(full_at, cost, interval, burst, now)
+    if full_at == nil or full_at < now then
+        full_at = now
+    end
+    local debt = full_at + cost * interval - now
+    if debt > burst * interval + EPSILON then
+        return false, full_at - now
+    end
+    return true, debt
+end
+
+-- The memory store ---------------------------------------------------------------
+
+local Memory = {}
+Memory.__index = Memory
+
+--- Creates a store that keeps its counters in the memory of the process.
+---
+--- The store removes an expired key when a call reads it. Every
+--- `sweep_interval` seconds one call removes all expired keys. A new key
+--- that would exceed `max_keys` first removes the expired keys. If the
+--- store is still full, it removes a tenth of the live keys in iteration
+--- order, so the memory of the store stays bounded under a flood of
+--- distinct keys.
+---
+--- The options are the following.
+---
+--- - `max_keys`: the largest number of keys, by default 100000.
+--- - `sweep_interval`: the seconds between two sweeps, by default 30.
+--- - `now`: a function that returns the time in seconds, by default the
+---   wall clock.
+--- @param options table? The options.
+--- @return table The store.
+function M.memory(options)
+    options = options or {}
+    local now = options.now or wall_clock
+    local store = setmetatable({}, Memory)
+    store.values = {}
+    store.expires = {}
+    store.count = 0
+    store.max_keys = options.max_keys or 100000
+    store.sweep_interval = options.sweep_interval or 30
+    store.now = now
+    store.next_sweep = now() + store.sweep_interval
+    return store
+end
+
+local function drop(self, key)
+    self.values[key] = nil
+    self.expires[key] = nil
+    self.count = self.count - 1
+end
+
+--- Removes every expired key.
+--- @return integer The number of keys that remain.
+function Memory:sweep()
+    local now = self.now()
+    local values, expires, count from self
+    for key, at in pairs(expires) do
+        if at <= now then
+            values[key] = nil
+            expires[key] = nil
+            count = count - 1
+        end
+    end
+    self.count = count
+    self.next_sweep = now + self.sweep_interval
+    return count
+end
+
+-- Makes room for one new key.
+local function reserve(self, now)
+    if now >= self.next_sweep then
+        self:sweep()
+    end
+    if self.count < self.max_keys then
+        return
+    end
+    if self:sweep() < self.max_keys then
+        return
+    end
+    local excess = max_of(1, self.max_keys // 10)
+    local values, expires from self
+    local key = next(expires)
+    while key ~= nil and excess > 0 do
+        local following = next(expires, key)
+        values[key] = nil
+        expires[key] = nil
+        self.count = self.count - 1
+        excess = excess - 1
+        key = following
+    end
+end
+
+--- Adds `amount` to the counter at `key`.
+--- @param key string The key.
+--- @param ttl number The lifetime in seconds of a counter that starts here.
+--- @param amount number? The amount, by default 1.
+--- @return number The new count.
+--- @return number The seconds until the counter expires.
+function Memory:incr(key, ttl, amount)
+    local now = self.now()
+    local expires = self.expires
+    local at = expires[key]
+    amount = amount or 1
+    if at ~= nil and at > now then
+        local count = self.values[key] + amount
+        self.values[key] = count
+        if now >= self.next_sweep then
+            self:sweep()
+        end
+        return count, at - now
+    end
+    if at ~= nil then
+        drop(self, key)
+    end
+    reserve(self, now)
+    self.values[key] = amount
+    expires[key] = now + ttl
+    self.count = self.count + 1
+    return amount, ttl
+end
+
+--- Returns the number at `key`.
+--- @param key string The key.
+--- @return number? The number, or nil when the key is absent or expired.
+function Memory:get(key)
+    local at = self.expires[key]
+    if at == nil then
+        return nil
+    end
+    if at <= self.now() then
+        drop(self, key)
+        return nil
+    end
+    return self.values[key]
+end
+
+--- Stores a number at `key`.
+--- @param key string The key.
+--- @param value number The number.
+--- @param ttl number The lifetime in seconds.
+function Memory:set(key, value, ttl)
+    local now = self.now()
+    if now >= self.next_sweep then
+        self:sweep()
+    end
+    if self.expires[key] == nil then
+        reserve(self, now)
+        self.count = self.count + 1
+    end
+    self.values[key] = value
+    self.expires[key] = now + ttl
+end
+
+--- Takes `cost` tokens from the token bucket at `key` in one step.
+---
+--- The header of the package describes the arguments and the stored
+--- value.
+--- @param key string The key.
+--- @param cost number The tokens to take.
+--- @param interval number The seconds one token takes to refill.
+--- @param burst number The capacity of the bucket in tokens.
+--- @param now number The time in seconds.
+--- @return boolean True if the tokens were taken.
+--- @return number The seconds until the bucket is full.
+function Memory:take(key, cost, interval, burst, now)
+    local allowed, debt = bucket_step(self:get(key), cost, interval, burst, now)
+    if allowed then
+        self:set(key, now + debt, debt)
+    end
+    return allowed, debt
+end
+
+--- Returns the number of keys in the store, expired ones included until
+--- a sweep removes them.
+--- @return integer
+function Memory:size()
+    return self.count
+end
+
+-- Limiters --------------------------------------------------------------------------
+
+local Limiter = {}
+Limiter.__index = Limiter
+
+local function info_of(limit, remaining, reset, retry_after)
+    return {
+        limit = limit,
+        remaining = remaining,
+        reset = max_of(0, ceil(reset - EPSILON)),
+        retry_after = retry_after and max_of(1, ceil(retry_after - EPSILON)) or nil,
+    }
+end
+
+local function check_fixed(self, key, cost)
+    local limit = self.max
+    local count, reset = self.store:incr(key, self.window, cost)
+    if count > limit then
+        return false, info_of(limit, 0, reset, reset)
+    end
+    return true, info_of(limit, limit - count, reset)
+end
+
+local function check_sliding(self, key, cost)
+    local limit, window, store = self.max, self.window, self.store
+    local now = self.now()
+    local index = floor(now / window)
+    local elapsed = now - index * window
+    local previous = store:get(key .. ":" .. (index - 1)) or 0
+    local current = store:incr(key .. ":" .. index, window * 2, cost)
+    local weight = 1 - elapsed / window
+    local estimate = previous * weight + current
+    if estimate > limit + EPSILON then
+        -- A refused request leaves the counter as it found it.
+        store:incr(key .. ":" .. index, window * 2, -cost)
+        current = current - cost
+        local wait = window - elapsed
+        if previous > 0 and current + cost <= limit then
+            wait = window * (1 - (limit - current - cost) / previous) - elapsed
+        end
+        return false, info_of(limit, max_of(0, floor(limit - previous * weight - current + EPSILON)), window - elapsed, wait)
+    end
+    return true, info_of(limit, max_of(0, floor(limit - estimate + EPSILON)), window - elapsed)
+end
+
+local function check_bucket(self, key, cost)
+    local store, burst from self
+    local interval = self.window / self.max
+    local now = self.now()
+    local allowed, debt
+    if self.atomic then
+        allowed, debt = store:take(key, cost, interval, burst, now)
+    else
+        allowed, debt = bucket_step(store:get(key), cost, interval, burst, now)
+        if allowed then
+            store:set(key, now + debt, debt)
+        end
+    end
+    local capacity = burst * interval
+    local remaining = max_of(0, floor((capacity - debt) / interval + EPSILON))
+    if not allowed then
+        return false, info_of(burst, remaining, debt, debt + cost * interval - capacity)
+    end
+    return true, info_of(burst, remaining, debt)
+end
+
+local ALGORITHMS = { fixed = check_fixed, sliding = check_sliding, bucket = check_bucket }
+
+--- Creates a limiter.
+---
+--- The options are the following.
+---
+--- - `max`: how many requests a key may make per window, by default 100.
+--- - `window`: the length of the window in seconds, by default 60.
+--- - `algorithm`: `"fixed"` (the default), `"sliding"`, or `"bucket"`.
+---   A fixed window starts at the first request of a key and allows `max`
+---   requests until it ends. A sliding window weighs the count of the
+---   previous window by the part of it that still overlaps the last
+---   `window` seconds, which smooths the bursts at window boundaries. A
+---   token bucket refills at `max` tokens per `window` and holds `burst`
+---   tokens at most.
+--- - `burst`: the capacity of the token bucket, by default `max`.
+--- - `store`: the store, by default a new `rate_limit.memory` store.
+--- - `prefix`: text that starts every key in the store, which keeps
+---   several limiters apart in one store.
+--- - `now`: a function that returns the time in seconds, by default the
+---   wall clock. A store of the package given no `now` of its own uses it.
+---
+--- An option out of range, such as a `max` below 1, raises an error.
+--- @param options table? The options.
+--- @return table The limiter.
+function M.new(options)
+    options = options or {}
+    local self = setmetatable({}, Limiter)
+    self.max = options.max or 100
+    self.window = options.window or 60
+    self.burst = options.burst or self.max
+    self.now = options.now or wall_clock
+    self.prefix = options.prefix or ""
+    local algorithm = options.algorithm or "fixed"
+    self.algorithm = algorithm
+    self.check_key = ALGORITHMS[algorithm]
+    if self.check_key == nil then
+        error(`rate_limit: unknown algorithm '$(tostring(algorithm))'`, 2)
+    end
+    if type(self.max) ~= "number" or self.max < 1 then
+        error("rate_limit: max must be a number of at least 1", 2)
+    end
+    if type(self.window) ~= "number" or self.window <= 0 then
+        error("rate_limit: window must be a positive number of seconds", 2)
+    end
+    if type(self.burst) ~= "number" or self.burst < 1 then
+        error("rate_limit: burst must be a number of at least 1", 2)
+    end
+    self.store = options.store or M.memory({ now = self.now })
+    self.atomic = type(self.store.take) == "function"
+    return self
+end
+
+--- Counts one request for `key` and tells whether it is allowed.
+---
+--- The second result is a table with these fields.
+---
+--- - `limit`: the most requests a window or a bucket allows.
+--- - `remaining`: how many more requests are allowed now.
+--- - `reset`: the whole seconds until the window ends or the bucket is
+---   full.
+--- - `retry_after`: for a refused request, the whole seconds to wait
+---   before the next attempt, at least 1.
+---
+--- Errors of the store pass through to the caller.
+--- @param key string The key, such as a client address or a user id.
+--- @param cost number? How many requests this one counts for, by default 1.
+--- @return boolean True if the request is allowed.
+--- @return table The state of the key.
+function Limiter:check(key, cost)
+    return self.check_key(self, self.prefix .. key, cost or 1)
+end
+
+-- The web plugin ------------------------------------------------------------------------
+
+local function default_key(req)
+    return req.ip or "*"
+end
+
+--- Returns a key function that reads the client address from the
+--- `X-Forwarded-For` header.
+---
+--- `hops` is the number of trusted proxies in front of the application.
+--- Each proxy appends the address it received the request from, so the
+--- client address is the entry `hops` places from the end of the header.
+--- Entries further left come from the client itself and are ignored. A
+--- request with fewer entries than `hops` gets the key `"*"`.
+--- @param hops integer? The number of trusted proxies, by default 1.
+--- @return function A function `key(req)` for the `key` option.
+function M.forwarded(hops)
+    hops = hops or 1
+    return function(req)
+        local header = req.headers["x-forwarded-for"]
+        if header == nil then
+            return "*"
+        end
+        local entries, n = {}, 0
+        for entry in header:gmatch("[^,%s]+") do
+            n = n + 1
+            entries[n] = entry
+        end
+        return entries[n - hops + 1] or "*"
+    end
+end
+
+--- Registers the limiter on a `web` scope, as in
+--- `app:register(rate_limit, { max = 100, window = 60 })`.
+---
+--- The plugin takes the options of `rate_limit.new` and the following.
+---
+--- - `key`: a function `key(req)` that returns the key of a request. A
+---   nil result lets the request pass uncounted. The default is `req.ip`
+---   when the server sets it. `network.serve` passes no client address, so
+---   by default every request shares the key `"*"` and the limit applies to
+---   the scope as a whole. Behind a reverse proxy, use
+---   `rate_limit.forwarded`.
+--- - `skip`: a function `skip(req)`. A true result lets the request pass
+---   uncounted.
+--- - `cost`: a function `cost(req)` that returns how many requests this
+---   one counts for.
+--- - `headers`: `false` leaves the `RateLimit-*` headers out.
+--- - `message`: the error text of the 429 response, by default
+---   `"too many requests"`.
+--- - `limiter`: a limiter from `rate_limit.new` to use, which several
+---   scopes may share.
+---
+--- A request over the limit is answered with status 429, `Retry-After`,
+--- and the JSON body `{ "error": message }`. The state of the key is in
+--- `req.rate_limit` for handlers and later hooks. Every response of the
+--- scope carries the `RateLimit-*` headers, error responses included. The
+--- plugin applies to the scope that registers it.
+--- @param scope table The `web` scope.
+--- @param options table? The options.
+function M.register(scope, options)
+    options = options or {}
+    local limiter = options.limiter or M.new(options)
+    local key_of = options.key or default_key
+    local skip = options.skip
+    local cost_of = options.cost
+    local with_headers = options.headers ~= false
+    local message = options.message or "too many requests"
+
+    scope:hook("on_request", function(req)
+        if skip and skip(req) then
+            return
+        end
+        local key = key_of(req)
+        if key == nil then
+            return
+        end
+        local allowed, info = limiter:check(tostring(key), cost_of and cost_of(req) or 1)
+        req.rate_limit = info
+        if not allowed then
+            info.refused = true
+            return 429, { error = message }
+        end
+    end)
+    scope:hook("on_send", function(req, status, payload, headers)
+        local info = req.rate_limit
+        if info == nil or not (with_headers or info.refused) then
+            return status, payload, headers
+        end
+        local out = {}
+        if headers then
+            for k, v in pairs(headers) do
+                out[k] = v
+            end
+        end
+        if with_headers then
+            out["RateLimit-Limit"] = tostring(info.limit)
+            out["RateLimit-Remaining"] = tostring(info.remaining)
+            out["RateLimit-Reset"] = tostring(info.reset)
+        end
+        if info.refused then
+            out["Retry-After"] = tostring(info.retry_after)
+        end
+        return status, payload, out
+    end)
+end
+
+--- Registers into the scope that calls `register`, so the limit covers
+--- every route of that scope.
+M.shared = true
+
+return M

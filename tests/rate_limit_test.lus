@@ -1,0 +1,529 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs:read=" .. PACKAGES .. "/*")
+package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+
+local rate_limit = require("rate_limit")
+local web = require("web")
+
+-- A clock that the test moves by hand.
+local function fake_clock(start)
+    local clock = { t = start or 1000000 }
+    clock.now = function() return clock.t end
+    function clock:advance(seconds) self.t = self.t + seconds end
+    return clock
+end
+
+local function limiter_with(options)
+    local clock = fake_clock(options.start)
+    options.now = clock.now
+    return rate_limit.new(options), clock
+end
+
+-- The memory store ---------------------------------------------------------------
+
+local function memory_incr_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now })
+    local count, reset = store:incr("a", 10)
+    assert(count == 1 and reset == 10)
+    clock:advance(4)
+    count, reset = store:incr("a", 10)
+    assert(count == 2 and reset == 6)
+    count = store:incr("a", 10, 5)
+    assert(count == 7)
+    clock:advance(6)
+    count, reset = store:incr("a", 10)
+    assert(count == 1 and reset == 10)
+    assert(store:size() == 1)
+end
+
+local function memory_get_set_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now })
+    assert(store:get("k") == nil)
+    store:set("k", 2.5, 3)
+    assert(store:get("k") == 2.5)
+    store:set("k", 4, 3)
+    assert(store:get("k") == 4 and store:size() == 1)
+    clock:advance(3)
+    assert(store:get("k") == nil)
+    assert(store:size() == 0)
+end
+
+local function memory_sweep_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now, sweep_interval = 5 })
+    for i = 1, 100 do
+        store:incr("short" .. i, 1)
+    end
+    store:incr("long", 100)
+    assert(store:size() == 101)
+    clock:advance(6)
+    -- The next call sweeps the expired keys.
+    store:incr("other", 1)
+    assert(store:size() == 2)
+    assert(store:get("long") == 1)
+end
+
+local function memory_explicit_sweep_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now, sweep_interval = 1000 })
+    store:incr("a", 1)
+    store:set("b", 1, 50)
+    clock:advance(2)
+    assert(store:sweep() == 1)
+    assert(store:get("b") == 1)
+end
+
+local function memory_bounded_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now, max_keys = 50 })
+    for i = 1, 5000 do
+        store:incr("key" .. i, 60)
+        assert(store:size() <= 50)
+    end
+    local live = 0
+    for i = 1, 5000 do
+        if store:get("key" .. i) then
+            live = live + 1
+        end
+    end
+    assert(live == store:size() and live <= 50 and live >= 40)
+    -- The newest key survived.
+    assert(store:get("key5000") == 1)
+end
+
+local function memory_bounded_prefers_expired_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now, max_keys = 10, sweep_interval = 1000 })
+    for i = 1, 9 do
+        store:incr("old" .. i, 1)
+    end
+    store:incr("keep", 100)
+    clock:advance(2)
+    store:incr("new", 100)
+    assert(store:size() == 2)
+    assert(store:get("keep") == 1 and store:get("new") == 1)
+end
+
+-- Fixed window ---------------------------------------------------------------------
+
+local function fixed_window_test()
+    local limiter, clock = limiter_with({ max = 3, window = 10 })
+    for i = 1, 3 do
+        local allowed, info = limiter:check("a")
+        assert(allowed)
+        assert(info.limit == 3 and info.remaining == 3 - i and info.reset == 10)
+        assert(info.retry_after == nil)
+    end
+    clock:advance(4)
+    local allowed, info = limiter:check("a")
+    assert(not allowed)
+    assert(info.remaining == 0 and info.reset == 6 and info.retry_after == 6)
+    clock:advance(6)
+    allowed, info = limiter:check("a")
+    assert(allowed and info.remaining == 2)
+end
+
+local function keys_are_independent_test()
+    local limiter = limiter_with({ max = 1, window = 10 })
+    assert(limiter:check("a"))
+    assert(not limiter:check("a"))
+    assert(limiter:check("b"))
+end
+
+local function cost_test()
+    local limiter = limiter_with({ max = 10, window = 10 })
+    local allowed, info = limiter:check("a", 7)
+    assert(allowed and info.remaining == 3)
+    allowed, info = limiter:check("a", 4)
+    assert(not allowed and info.remaining == 0)
+end
+
+local function fractional_reset_rounds_up_test()
+    local limiter, clock = limiter_with({ max = 1, window = 10 })
+    limiter:check("a")
+    clock:advance(9.75)
+    local allowed, info = limiter:check("a")
+    assert(not allowed and info.reset == 1 and info.retry_after == 1)
+end
+
+local function prefix_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now })
+    local a = rate_limit.new({ max = 1, store = store, prefix = "login:", now = clock.now })
+    local b = rate_limit.new({ max = 1, store = store, prefix = "api:", now = clock.now })
+    assert(a:check("u1"))
+    assert(b:check("u1"))
+    assert(not a:check("u1"))
+    assert(store:get("login:u1") == 2)
+end
+
+-- Sliding window --------------------------------------------------------------------
+
+local function sliding_window_test()
+    -- Windows are aligned to multiples of the window length.
+    local limiter, clock = limiter_with({ max = 10, window = 10, algorithm = "sliding", start = 1000 })
+    for i = 1, 10 do
+        local allowed, info = limiter:check("a")
+        assert(allowed and info.remaining == 10 - i)
+    end
+    local allowed, info = limiter:check("a")
+    assert(not allowed and info.remaining == 0)
+    assert(info.retry_after == 10 and info.reset == 10)
+    -- Half of the next window: half of the previous count still weighs.
+    clock:advance(15)
+    for _ = 1, 5 do
+        assert(limiter:check("a"))
+    end
+    allowed, info = limiter:check("a")
+    assert(not allowed)
+    -- One more request fits once the previous window weighs 4 or less.
+    assert(info.retry_after == 1)
+    clock:advance(1)
+    assert(limiter:check("a"))
+end
+
+local function sliding_refused_requests_do_not_count_test()
+    local limiter, clock = limiter_with({ max = 2, window = 10, algorithm = "sliding", start = 1000 })
+    assert(limiter:check("a"))
+    assert(limiter:check("a"))
+    for _ = 1, 50 do
+        assert(not limiter:check("a"))
+    end
+    -- Two windows later the key is clean, whatever was refused.
+    clock:advance(20)
+    local allowed, info = limiter:check("a")
+    assert(allowed and info.remaining == 1)
+end
+
+local function sliding_smooths_the_boundary_test()
+    local limiter, clock = limiter_with({ max = 10, window = 10, algorithm = "sliding", start = 1009 })
+    for _ = 1, 10 do
+        assert(limiter:check("a"))
+    end
+    -- A fixed window would allow ten more one second later.
+    clock:advance(2)
+    local passed = 0
+    for _ = 1, 10 do
+        if limiter:check("a") then
+            passed = passed + 1
+        end
+    end
+    assert(passed == 1)
+end
+
+-- Token bucket ------------------------------------------------------------------------
+
+local function bucket_test()
+    local limiter, clock = limiter_with({ max = 10, window = 10, algorithm = "bucket", burst = 3 })
+    for i = 1, 3 do
+        local allowed, info = limiter:check("a")
+        assert(allowed and info.limit == 3 and info.remaining == 3 - i)
+    end
+    local allowed, info = limiter:check("a")
+    assert(not allowed and info.remaining == 0 and info.retry_after == 1)
+    -- One token per second.
+    clock:advance(1)
+    allowed, info = limiter:check("a")
+    assert(allowed and info.remaining == 0)
+    assert(not limiter:check("a"))
+    clock:advance(2)
+    assert(limiter:check("a"))
+    assert(limiter:check("a"))
+    assert(not limiter:check("a"))
+    -- A long pause refills the bucket to its capacity and no further.
+    clock:advance(1000)
+    allowed, info = limiter:check("a")
+    assert(allowed and info.remaining == 2)
+end
+
+local function bucket_fractional_rate_test()
+    local limiter, clock = limiter_with({ max = 100, window = 60, algorithm = "bucket" })
+    for i = 1, 100 do
+        local allowed, info = limiter:check("a")
+        assert(allowed and info.remaining == 100 - i)
+    end
+    local allowed, info = limiter:check("a")
+    assert(not allowed and info.retry_after == 1)
+    clock:advance(0.6)
+    assert(limiter:check("a"))
+    assert(not limiter:check("a"))
+end
+
+local function bucket_cost_and_reset_test()
+    local limiter = limiter_with({ max = 5, window = 10, algorithm = "bucket" })
+    local allowed, info = limiter:check("a", 4)
+    assert(allowed and info.remaining == 1 and info.reset == 8)
+    allowed, info = limiter:check("a", 2)
+    assert(not allowed and info.remaining == 1 and info.retry_after == 2)
+    -- A cost above the capacity never passes.
+    assert(not limiter:check("b", 6))
+end
+
+local function bucket_store_stays_small_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now, sweep_interval = 1 })
+    local limiter = rate_limit.new({ max = 10, window = 10, algorithm = "bucket", store = store, now = clock.now })
+    for i = 1, 200 do
+        limiter:check("client" .. i)
+    end
+    assert(store:size() == 200)
+    clock:advance(30)
+    limiter:check("late")
+    assert(store:size() == 1)
+end
+
+local function bucket_atomic_take_test()
+    local clock = fake_clock()
+    local store = rate_limit.memory({ now = clock.now })
+    local allowed, full_in = store:take("k", 2, 1, 3, clock.t)
+    assert(allowed and full_in == 2)
+    allowed, full_in = store:take("k", 2, 1, 3, clock.t)
+    assert(not allowed and full_in == 2)
+    assert(store:get("k") == clock.t + 2)
+    clock:advance(1)
+    allowed, full_in = store:take("k", 2, 1, 3, clock.t)
+    assert(allowed and full_in == 3)
+end
+
+local function bucket_prefers_take_test()
+    -- A store with `take` is never asked for the separate get and set.
+    local inner = rate_limit.memory()
+    local calls = 0
+    local store = {}
+    function store:take(...)
+        calls = calls + 1
+        coroutine.yield()
+        return inner:take(...)
+    end
+    function store:get() error("get must not be called") end
+    function store:set() error("set must not be called") end
+    function store:incr() error("incr must not be called") end
+    local limiter = rate_limit.new({ max = 60, window = 60, burst = 3, algorithm = "bucket", store = store })
+    local results, threads = {}, {}
+    for i = 1, 8 do
+        threads[i] = coroutine.create(function() results[i] = limiter:check("shared") end)
+    end
+    for _ = 1, 2 do
+        for _, co in ipairs(threads) do
+            if coroutine.status(co) == "suspended" then
+                assert(coroutine.resume(co))
+            end
+        end
+    end
+    local passed = 0
+    for i = 1, 8 do
+        if results[i] then
+            passed = passed + 1
+        end
+    end
+    -- All eight requests arrived together and exactly the burst passed.
+    assert(calls == 8 and passed == 3)
+end
+
+local function bucket_without_take_test()
+    local clock = fake_clock()
+    local inner = rate_limit.memory({ now = clock.now })
+    local store = {}
+    function store:get(key) return inner:get(key) end
+    function store:set(key, value, ttl) return inner:set(key, value, ttl) end
+    local limiter = rate_limit.new({ max = 10, window = 10, burst = 2, algorithm = "bucket", store = store, now = clock.now })
+    assert(limiter:check("a") and limiter:check("a"))
+    local allowed, info = limiter:check("a")
+    assert(not allowed and info.retry_after == 1)
+end
+
+-- Options ------------------------------------------------------------------------------
+
+local function invalid_options_test()
+    raises(function() rate_limit.new({ algorithm = "leaky" }) end, "unknown algorithm 'leaky'")
+    raises(function() rate_limit.new({ max = 0 }) end, "max must be")
+    raises(function() rate_limit.new({ window = -1 }) end, "window must be")
+    raises(function() rate_limit.new({ burst = 0, algorithm = "bucket" }) end, "burst must be")
+end
+
+local function custom_store_test()
+    -- A store with the three documented methods and nothing else.
+    local calls = {}
+    local data = {}
+    local store = {}
+    function store:incr(key, ttl, amount)
+        calls[#calls + 1] = `incr $key $ttl $amount`
+        data[key] = (data[key] or 0) + amount
+        return data[key], ttl
+    end
+    function store:get(key) return data[key] end
+    function store:set(key, value) data[key] = value end
+    local limiter = rate_limit.new({ max = 2, window = 30, store = store })
+    assert(limiter:check("k"))
+    assert(limiter:check("k"))
+    assert(not limiter:check("k"))
+    assert(calls[1] == "incr k 30 1")
+end
+
+local function store_may_suspend_test()
+    -- A store that yields inside every call, as a network client does.
+    local inner = rate_limit.memory()
+    local store = {}
+    function store:incr(...) coroutine.yield() return inner:incr(...) end
+    function store:get(...) coroutine.yield() return inner:get(...) end
+    function store:set(...) coroutine.yield() return inner:set(...) end
+    local limiter = rate_limit.new({ max = 3, window = 60, algorithm = "sliding", store = store })
+    local results = {}
+    local threads = {}
+    for i = 1, 5 do
+        threads[i] = coroutine.create(function()
+            results[i] = limiter:check("shared")
+        end)
+    end
+    local running = true
+    while running do
+        running = false
+        for _, co in ipairs(threads) do
+            if coroutine.status(co) == "suspended" then
+                assert(coroutine.resume(co))
+                running = true
+            end
+        end
+    end
+    local passed = 0
+    for i = 1, 5 do
+        if results[i] then
+            passed = passed + 1
+        end
+    end
+    assert(passed <= 3 and passed >= 1)
+end
+
+-- The web plugin -------------------------------------------------------------------------
+
+local function limited_app(options)
+    local clock = fake_clock()
+    options.now = clock.now
+    local app = web.app({ log = function() end })
+    app:register(rate_limit, options)
+    app:get("/", function() return { ok = true } end)
+    app:get("/boom", function() error("x") end)
+    return app, clock
+end
+
+local function web_headers_test()
+    local app = limited_app({ max = 2, window = 60 })
+    local res = app:inject({ path = "/" })
+    assert(res.status == 200)
+    assert(res.headers["ratelimit-limit"] == "2")
+    assert(res.headers["ratelimit-remaining"] == "1")
+    assert(res.headers["ratelimit-reset"] == "60")
+    assert(res.headers["retry-after"] == nil)
+    assert(res.headers["content-type"]:find("application/json", 1, true))
+end
+
+local function web_429_test()
+    local app, clock = limited_app({ max = 2, window = 60 })
+    app:inject({ path = "/" })
+    app:inject({ path = "/" })
+    clock:advance(20)
+    local res = app:inject({ path = "/" })
+    assert(res.status == 429)
+    assert(res:json().error == "too many requests")
+    assert(res.headers["retry-after"] == "40")
+    assert(res.headers["ratelimit-remaining"] == "0")
+    assert(res.headers["ratelimit-reset"] == "40")
+    clock:advance(40)
+    assert(app:inject({ path = "/" }).status == 200)
+end
+
+local function web_default_key_test()
+    -- Without a client address every request shares one key.
+    local app = limited_app({ max = 1 })
+    assert(app:inject({ path = "/", headers = { ["X-Forwarded-For"] = "1.1.1.1" } }).status == 200)
+    assert(app:inject({ path = "/", headers = { ["X-Forwarded-For"] = "2.2.2.2" } }).status == 429)
+end
+
+local function web_key_function_test()
+    local app = limited_app({ max = 1, key = function(req) return req.headers["x-api-key"] end, message = "slow down" })
+    assert(app:inject({ path = "/", headers = { ["X-Api-Key"] = "a" } }).status == 200)
+    assert(app:inject({ path = "/", headers = { ["X-Api-Key"] = "b" } }).status == 200)
+    local res = app:inject({ path = "/", headers = { ["X-Api-Key"] = "a" } })
+    assert(res.status == 429 and res:json().error == "slow down")
+    -- A nil key passes uncounted and gets no headers.
+    for _ = 1, 3 do
+        res = app:inject({ path = "/" })
+        assert(res.status == 200 and res.headers["ratelimit-limit"] == nil)
+    end
+end
+
+local function web_forwarded_test()
+    local key = rate_limit.forwarded(1)
+    assert(key({ headers = { ["x-forwarded-for"] = "9.9.9.9, 203.0.113.7" } }) == "203.0.113.7")
+    assert(key({ headers = {} }) == "*")
+    local two = rate_limit.forwarded(2)
+    assert(two({ headers = { ["x-forwarded-for"] = "spoofed, 198.51.100.1, 10.0.0.1" } }) == "198.51.100.1")
+    assert(two({ headers = { ["x-forwarded-for"] = "10.0.0.1" } }) == "*")
+    -- A client cannot choose its key by sending the header itself.
+    local app = limited_app({ max = 1, key = key })
+    assert(app:inject({ path = "/", headers = { ["X-Forwarded-For"] = "1.1.1.1, 203.0.113.7" } }).status == 200)
+    assert(app:inject({ path = "/", headers = { ["X-Forwarded-For"] = "2.2.2.2, 203.0.113.7" } }).status == 429)
+end
+
+local function web_skip_and_cost_test()
+    local app = limited_app({
+        max = 4,
+        skip = function(req) return req.headers["x-internal"] == "1" end,
+        cost = function(req) return req.query == "heavy" and 3 or 1 end,
+    })
+    for _ = 1, 10 do
+        assert(app:inject({ path = "/", headers = { ["X-Internal"] = "1" } }).status == 200)
+    end
+    assert(app:inject({ path = "/?heavy" }).headers["ratelimit-remaining"] == "1")
+    assert(app:inject({ path = "/" }).status == 200)
+    assert(app:inject({ path = "/" }).status == 429)
+end
+
+local function web_headers_off_test()
+    local app = limited_app({ max = 1, headers = false })
+    local res = app:inject({ path = "/" })
+    assert(res.headers["ratelimit-limit"] == nil)
+    res = app:inject({ path = "/" })
+    assert(res.status == 429 and res.headers["ratelimit-limit"] == nil and res.headers["retry-after"] == "60")
+end
+
+local function web_scope_and_shared_limiter_test()
+    local clock = fake_clock()
+    local limiter = rate_limit.new({ max = 2, now = clock.now })
+    local app = web.app()
+    app:get("/open", function() return "open" end)
+    app:register(function(scope)
+        scope:register(rate_limit, { limiter = limiter })
+        scope:get("/a", function(req) return tostring(req.rate_limit.remaining) end)
+        scope:post("/b", function() return "b" end)
+    end, { prefix = "/api" })
+    assert(app:inject({ path = "/api/a" }).body == "1")
+    assert(app:inject({ method = "POST", path = "/api/b" }).status == 200)
+    assert(app:inject({ path = "/api/a" }).status == 429)
+    for _ = 1, 5 do
+        local res = app:inject({ path = "/open" })
+        assert(res.status == 200 and res.headers["ratelimit-limit"] == nil)
+    end
+end
+
+local function web_bucket_headers_test()
+    local app, clock = limited_app({ max = 60, window = 60, burst = 2, algorithm = "bucket" })
+    assert(app:inject({ path = "/" }).headers["ratelimit-limit"] == "2")
+    assert(app:inject({ path = "/" }).headers["ratelimit-remaining"] == "0")
+    local res = app:inject({ path = "/" })
+    assert(res.status == 429 and res.headers["retry-after"] == "1")
+    clock:advance(1)
+    assert(app:inject({ path = "/" }).status == 200)
+end
+
+local function web_errors_still_count_test()
+    local app = limited_app({ max = 1 })
+    local res = app:inject({ path = "/boom" })
+    assert(res.status == 500)
+    -- Error responses carry the headers too.
+    assert(res.headers["ratelimit-limit"] == "1" and res.headers["ratelimit-remaining"] == "0")
+    assert(app:inject({ path = "/boom" }).status == 429)
+end
