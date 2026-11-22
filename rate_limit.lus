@@ -421,11 +421,11 @@ end
 --- The plugin takes the options of `rate_limit.new` and the following.
 ---
 --- - `key`: a function `key(req)` that returns the key of a request. A
----   nil result lets the request pass uncounted. The default is `req.ip`
----   when the server sets it. `network.serve` passes no client address, so
----   by default every request shares the key `"*"`, which makes the limit
----   apply to the scope as a whole. Behind a reverse proxy, use
----   `rate_limit.forwarded`.
+---   nil result lets the request pass uncounted. The default is `req.ip`,
+---   the address of the client that `network.serve` reports, so each
+---   address has its own count. A request without `req.ip` gets the key
+---   `"*"`. Behind a reverse proxy `req.ip` is the address of the proxy,
+---   so use `rate_limit.forwarded` there.
 --- - `skip`: a function `skip(req)`. A true result lets the request pass
 ---   uncounted.
 --- - `cost`: a function `cost(req)` that returns how many requests this

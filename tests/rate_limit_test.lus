@@ -436,10 +436,39 @@ local function web_429_test()
 end
 
 local function web_default_key_test()
-    -- Without a client address every request shares one key.
+    -- Each client address has its own count, whatever its headers say.
     local app = limited_app({ max = 1 })
-    assert(app:inject({ path = "/", headers = { ["X-Forwarded-For"] = "1.1.1.1" } }).status == 200)
-    assert(app:inject({ path = "/", headers = { ["X-Forwarded-For"] = "2.2.2.2" } }).status == 429)
+    assert(app:inject({ path = "/", ip = "203.0.113.7" }).status == 200)
+    assert(app:inject({ path = "/", ip = "203.0.113.7", port = 9, headers = { ["X-Forwarded-For"] = "2.2.2.2" } }).status == 429)
+    assert(app:inject({ path = "/", ip = "198.51.100.1" }).status == 200)
+    assert(app:inject({ path = "/", ip = "198.51.100.1" }).status == 429)
+    -- An injected request comes from 127.0.0.1 by default.
+    assert(app:inject({ path = "/" }).status == 200)
+    assert(app:inject({ path = "/", ip = "127.0.0.1" }).status == 429)
+end
+
+local function web_default_key_over_the_wire_test()
+    pledge("network")
+    local app = web.app({ log = function() end })
+    local seen
+    app:register(rate_limit, { max = 1, key = function(req)
+        seen = req.ip
+        return req.ip
+    end })
+    app:get("/", function() return "ok" end)
+    local plain = web.app({ log = function() end })
+    plain:register(rate_limit, { max = 1 })
+    plain:get("/", function() return "ok" end)
+    for _, target in ipairs({ app, plain }) do
+        local server = network.tcp.bind("127.0.0.1", 0)
+        local _, port = server:getsockname()
+        local serving = coroutine.detach(coroutine.create(function() target:listen(server) end))
+        assert(network.fetch(`http://127.0.0.1:$port/`) == 200)
+        assert(network.fetch(`http://127.0.0.1:$port/`) == 429)
+        coroutine.close(serving)
+        server:close()
+    end
+    assert(seen == "127.0.0.1")
 end
 
 local function web_key_function_test()
