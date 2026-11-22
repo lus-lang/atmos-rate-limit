@@ -1,6 +1,8 @@
 # rate_limit
 
-Limits requests per key with a fixed window, a sliding window, or a token bucket. Counters live in memory by default or in any store with the methods `incr`, `get`, and `set`. A `web` plugin sets the `RateLimit` headers and answers 429.
+`rate_limit` limits how many requests each client may make, counting requests per key with a fixed window, a sliding window, or a token bucket. It keeps the counters in memory by default or in any store with the methods `incr`, `get`, and `set`. Registered as a `web` plugin, it sets the `RateLimit` headers and answers a request over the limit with status 429.
+
+The following example limits each API key of a web application to 100 requests per minute, then checks a token bucket for one user directly.
 
 ```lus nocheck
 local rate_limit = require("https://atmosp.here/2.0/rate_limit.lus")
@@ -20,6 +22,6 @@ if not allowed then
 end
 ```
 
-The package requires Lus 2.0. It needs no permissions. It calls no `pledge` of its own, so the program that loads it keeps control of its permissions.
+The package requires Lus 2.0 and declares no permissions. It never calls `pledge`, so the program that loads it keeps control of its permissions.
 
-The reference is in the doc comments of `rate_limit.lus`. Run `lus doc rate_limit.lus` to print it.
+The reference is in the doc comments of `rate_limit.lus`, which `lus doc rate_limit.lus` prints.

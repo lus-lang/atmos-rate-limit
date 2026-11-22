@@ -1,7 +1,7 @@
 local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
 local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
-pledge("load", "fs:read=" .. PACKAGES .. "/*")
-package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+pledge("load", `fs:read=$PACKAGES/*`)
+package.path = `$ROOT/?.lus;$PACKAGES/web/?.lus;$PACKAGES/atmos-web/?.lus;$(package.path)`
 
 local rate_limit = require("rate_limit")
 local web = require("web")

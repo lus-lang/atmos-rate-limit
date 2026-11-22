@@ -1,20 +1,20 @@
 --- Limits how many requests each client may make.
 ---
 --- A limiter counts requests per key with a fixed window, a sliding window,
---- or a token bucket, and reports whether a request is allowed, how many
+--- or a token bucket, then reports whether a request is allowed, how many
 --- remain, and when to retry. Registered on a `web` scope, the package
---- applies a limiter to the scope: it sets the `RateLimit-Limit`, `RateLimit-Remaining`, and
---- `RateLimit-Reset` headers and answers a request over the limit with 429
---- and `Retry-After`.
+--- applies a limiter to the scope: it sets the `RateLimit-Limit`,
+--- `RateLimit-Remaining`, and `RateLimit-Reset` headers and answers a request
+--- over the limit with 429 and `Retry-After`.
 ---
---- Counters live in a store. `rate_limit.memory` keeps them in the
---- process. Any table with the three methods below works in its place, so
---- that several processes can share their counters through a database.
+--- A store keeps the counters. `rate_limit.memory` keeps them in the
+--- process. Any table with the following methods can replace it, so several
+--- processes can share their counters in a database.
 ---
 --- - `store:incr(key, ttl, amount)` adds `amount` to the counter at `key`
 ---   and returns the new count and the seconds until the counter expires.
 ---   A key that is absent or expired starts from 0 and expires `ttl`
----   seconds later. An increment of a live counter keeps its expiry.
+---   seconds later. An increment of an unexpired counter keeps its expiry.
 --- - `store:get(key)` returns the number at `key`, or nil when the key is
 ---   absent or expired.
 --- - `store:set(key, value, ttl)` stores a number that expires after `ttl`
@@ -24,15 +24,15 @@
 --- client does inside `network.serve`. The token bucket reads a key with
 --- `get` and writes it with `set`. When a store suspends between the two,
 --- requests that arrive together may each read the same state and take
---- the same token. A store closes that gap with a fourth, optional method
---- that does both steps as one operation, which the limiter uses when it
---- is present.
+--- the same token. A store prevents this with the optional method `take`,
+--- which does both steps as one operation. The limiter uses `take` when the
+--- store has it.
 ---
 --- - `store:take(key, cost, interval, burst, now)` takes `cost` tokens
 ---   from the bucket at `key`. `interval` is the seconds one token takes
 ---   to refill, `burst` the capacity in tokens, and `now` the time in
 ---   seconds. The number stored at `key` is the time at which the bucket
----   is full again, and a missing key or a time before `now` means a full
+---   is full again. A missing key or a time before `now` means a full
 ---   bucket. When that time plus `cost * interval` lies at most
 ---   `burst * interval` after `now`, the method stores the sum with a
 ---   lifetime that ends at the sum and returns true and the seconds from
@@ -41,7 +41,7 @@
 ---   these steps as one script.
 ---
 --- @package rate_limit
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-rate-limit
@@ -84,11 +84,10 @@ Memory.__index = Memory
 --- Creates a store that keeps its counters in the memory of the process.
 ---
 --- The store removes an expired key when a call reads it. Every
---- `sweep_interval` seconds one call removes all expired keys. A new key
---- that would exceed `max_keys` first removes the expired keys. If the
---- store is still full, it removes a tenth of the live keys in iteration
---- order, so the memory of the store stays bounded under a flood of
---- distinct keys.
+--- `sweep_interval` seconds, one call removes all expired keys. When a new
+--- key would exceed `max_keys`, the store first removes the expired keys. If
+--- it is still full, it removes a tenth of the unexpired keys in iteration
+--- order, so its memory stays bounded however many distinct keys arrive.
 ---
 --- The options are the following.
 ---
@@ -222,8 +221,7 @@ end
 
 --- Takes `cost` tokens from the token bucket at `key` in one step.
 ---
---- The header of the package describes the arguments and the stored
---- value.
+--- The package overview describes the arguments and the stored value.
 --- @param key string The key.
 --- @param cost number The tokens to take.
 --- @param interval number The seconds one token takes to refill.
@@ -241,7 +239,7 @@ end
 
 --- Returns the number of keys in the store, expired ones included until
 --- a sweep removes them.
---- @return integer
+--- @return integer The number of keys.
 function Memory:size()
     return self.count
 end
@@ -274,13 +272,13 @@ local function check_sliding(self, key, cost)
     local now = self.now()
     local index = floor(now / window)
     local elapsed = now - index * window
-    local previous = store:get(key .. ":" .. (index - 1)) or 0
-    local current = store:incr(key .. ":" .. index, window * 2, cost)
+    local previous = store:get(`$key:$(index - 1)`) or 0
+    local current = store:incr(`$key:$index`, window * 2, cost)
     local weight = 1 - elapsed / window
     local estimate = previous * weight + current
     if estimate > limit + EPSILON then
         -- A refused request leaves the counter as it found it.
-        store:incr(key .. ":" .. index, window * 2, -cost)
+        store:incr(`$key:$index`, window * 2, -cost)
         current = current - cost
         local wait = window - elapsed
         if previous > 0 and current + cost <= limit then
@@ -332,7 +330,7 @@ local ALGORITHMS = { fixed = check_fixed, sliding = check_sliding, bucket = chec
 --- - `prefix`: text that starts every key in the store, which keeps
 ---   several limiters apart in one store.
 --- - `now`: a function that returns the time in seconds, by default the
----   wall clock. A store of the package given no `now` of its own uses it.
+---   wall clock. The default store uses the same function.
 ---
 --- An option out of range, such as a `max` below 1, raises an error.
 --- @param options table? The options.
@@ -365,7 +363,7 @@ function M.new(options)
     return self
 end
 
---- Counts one request for `key` and tells whether it is allowed.
+--- Counts one request for `key` and returns whether it is allowed.
 ---
 --- The second result is a table with these fields.
 ---
@@ -376,7 +374,7 @@ end
 --- - `retry_after`: for a refused request, the whole seconds to wait
 ---   before the next attempt, at least 1.
 ---
---- Errors of the store pass through to the caller.
+--- An error that the store raises propagates to the caller.
 --- @param key string The key, such as a client address or a user id.
 --- @param cost number? How many requests this one counts for, by default 1.
 --- @return boolean True if the request is allowed.
@@ -425,8 +423,8 @@ end
 --- - `key`: a function `key(req)` that returns the key of a request. A
 ---   nil result lets the request pass uncounted. The default is `req.ip`
 ---   when the server sets it. `network.serve` passes no client address, so
----   by default every request shares the key `"*"` and the limit applies to
----   the scope as a whole. Behind a reverse proxy, use
+---   by default every request shares the key `"*"`, which makes the limit
+---   apply to the scope as a whole. Behind a reverse proxy, use
 ---   `rate_limit.forwarded`.
 --- - `skip`: a function `skip(req)`. A true result lets the request pass
 ---   uncounted.
