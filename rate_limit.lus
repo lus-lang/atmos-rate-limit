@@ -40,6 +40,31 @@
 ---   the seconds from `now` to the time it read. A database store runs
 ---   these steps as one script.
 ---
+--- The following lines limit each API key of a `web` application to 100
+--- requests per minute, then check a token bucket for one user directly.
+---
+--- ```lus nocheck
+--- local web = require("https://atmosp.here/2.0/web.lus")
+--- local rate_limit = require("https://atmosp.here/2.0/rate_limit.lus")
+---
+--- local app = web.app()
+---
+--- app:register(rate_limit, {
+---     window = 60,
+---     max = 100,
+---     key = function(req)
+---         return req.headers["x-api-key"]
+---     end,
+--- })
+---
+--- local limiter = rate_limit.new({ algorithm = "bucket", max = 5, window = 1 })
+--- local allowed, info = limiter:check("user:42")
+---
+--- if not allowed then
+---     print(`retry in $(info.retry_after) s`)
+--- end
+--- ```
+---
 --- @package rate_limit
 --- @version 1.0.0
 --- @lus 2.0
@@ -69,10 +94,13 @@ local function bucket_step(full_at, cost, interval, burst, now)
     if full_at == nil or full_at < now then
         full_at = now
     end
+
     local debt = full_at + cost * interval - now
+
     if debt > burst * interval + EPSILON then
         return false, full_at - now
     end
+
     return true, debt
 end
 
@@ -122,6 +150,7 @@ end
 function Memory:sweep()
     local now = self.now()
     local values, expires, count from self
+
     for key, at in pairs(expires) do
         if at <= now then
             values[key] = nil
@@ -129,6 +158,7 @@ function Memory:sweep()
             count = count - 1
         end
     end
+
     self.count = count
     self.next_sweep = now + self.sweep_interval
     return count
@@ -139,15 +169,19 @@ local function reserve(self, now)
     if now >= self.next_sweep then
         self:sweep()
     end
+
     if self.count < self.max_keys then
         return
     end
+
     if self:sweep() < self.max_keys then
         return
     end
+
     local excess = max_of(1, self.max_keys // 10)
     local values, expires from self
     local key = next(expires)
+
     while key ~= nil and excess > 0 do
         local following = next(expires, key)
         values[key] = nil
@@ -169,17 +203,22 @@ function Memory:incr(key, ttl, amount)
     local expires = self.expires
     local at = expires[key]
     amount = amount or 1
+
     if at ~= nil and at > now then
         local count = self.values[key] + amount
         self.values[key] = count
+
         if now >= self.next_sweep then
             self:sweep()
         end
+
         return count, at - now
     end
+
     if at ~= nil then
         drop(self, key)
     end
+
     reserve(self, now)
     self.values[key] = amount
     expires[key] = now + ttl
@@ -192,13 +231,16 @@ end
 --- @return number? The number, or nil when the key is absent or expired.
 function Memory:get(key)
     local at = self.expires[key]
+
     if at == nil then
         return nil
     end
+
     if at <= self.now() then
         drop(self, key)
         return nil
     end
+
     return self.values[key]
 end
 
@@ -208,13 +250,16 @@ end
 --- @param ttl number The lifetime in seconds.
 function Memory:set(key, value, ttl)
     local now = self.now()
+
     if now >= self.next_sweep then
         self:sweep()
     end
+
     if self.expires[key] == nil then
         reserve(self, now)
         self.count = self.count + 1
     end
+
     self.values[key] = value
     self.expires[key] = now + ttl
 end
@@ -231,9 +276,11 @@ end
 --- @return number The seconds until the bucket is full.
 function Memory:take(key, cost, interval, burst, now)
     local allowed, debt = bucket_step(self:get(key), cost, interval, burst, now)
+
     if allowed then
         self:set(key, now + debt, debt)
     end
+
     return allowed, debt
 end
 
@@ -261,9 +308,11 @@ end
 local function check_fixed(self, key, cost)
     local limit = self.max
     local count, reset = self.store:incr(key, self.window, cost)
+
     if count > limit then
         return false, info_of(limit, 0, reset, reset)
     end
+
     return true, info_of(limit, limit - count, reset)
 end
 
@@ -276,16 +325,25 @@ local function check_sliding(self, key, cost)
     local current = store:incr(`$key:$index`, window * 2, cost)
     local weight = 1 - elapsed / window
     local estimate = previous * weight + current
+
     if estimate > limit + EPSILON then
         -- A refused request leaves the counter as it found it.
         store:incr(`$key:$index`, window * 2, -cost)
         current = current - cost
         local wait = window - elapsed
+
         if previous > 0 and current + cost <= limit then
             wait = window * (1 - (limit - current - cost) / previous) - elapsed
         end
-        return false, info_of(limit, max_of(0, floor(limit - previous * weight - current + EPSILON)), window - elapsed, wait)
+
+        return false, info_of(
+            limit,
+            max_of(0, floor(limit - previous * weight - current + EPSILON)),
+            window - elapsed,
+            wait
+        )
     end
+
     return true, info_of(limit, max_of(0, floor(limit - estimate + EPSILON)), window - elapsed)
 end
 
@@ -294,19 +352,24 @@ local function check_bucket(self, key, cost)
     local interval = self.window / self.max
     local now = self.now()
     local allowed, debt
+
     if self.atomic then
         allowed, debt = store:take(key, cost, interval, burst, now)
     else
         allowed, debt = bucket_step(store:get(key), cost, interval, burst, now)
+
         if allowed then
             store:set(key, now + debt, debt)
         end
     end
+
     local capacity = burst * interval
     local remaining = max_of(0, floor((capacity - debt) / interval + EPSILON))
+
     if not allowed then
         return false, info_of(burst, remaining, debt, debt + cost * interval - capacity)
     end
+
     return true, info_of(burst, remaining, debt)
 end
 
@@ -346,18 +409,23 @@ function M.new(options)
     local algorithm = options.algorithm or "fixed"
     self.algorithm = algorithm
     self.check_key = ALGORITHMS[algorithm]
+
     if self.check_key == nil then
-        error(`rate_limit: unknown algorithm '$(tostring(algorithm))'`, 2)
+        error(`rate_limit: unknown algorithm '$algorithm'`, 2)
     end
+
     if type(self.max) ~= "number" or self.max < 1 then
         error("rate_limit: max must be a number of at least 1", 2)
     end
+
     if type(self.window) ~= "number" or self.window <= 0 then
         error("rate_limit: window must be a positive number of seconds", 2)
     end
+
     if type(self.burst) ~= "number" or self.burst < 1 then
         error("rate_limit: burst must be a number of at least 1", 2)
     end
+
     self.store = options.store or M.memory({ now = self.now })
     self.atomic = type(self.store.take) == "function"
     return self
@@ -401,16 +469,21 @@ end
 --- @return function A function `key(req)` for the `key` option.
 function M.forwarded(hops)
     hops = hops or 1
+
     return function(req)
         local header = req.headers["x-forwarded-for"]
+
         if header == nil then
             return "*"
         end
+
         local entries, n = {}, 0
+
         for entry in header:gmatch("[^,%s]+") do
             n = n + 1
             entries[n] = entry
         end
+
         return entries[n - hops + 1] or "*"
     end
 end
@@ -453,39 +526,44 @@ function M.register(scope, options)
     local message = options.message or "too many requests"
 
     scope:hook("on_request", function(req)
-        if skip and skip(req) then
+        if skip?(req) then
             return
         end
+
         local key = key_of(req)
+
         if key == nil then
             return
         end
-        local allowed, info = limiter:check(tostring(key), cost_of and cost_of(req) or 1)
+
+        local allowed, info = limiter:check(tostring(key), cost_of?(req) or 1)
         req.rate_limit = info
+
         if not allowed then
             info.refused = true
             return 429, { error = message }
         end
     end)
+
     scope:hook("on_send", function(req, status, payload, headers)
         local info = req.rate_limit
+
         if info == nil or not (with_headers or info.refused) then
             return status, payload, headers
         end
-        local out = {}
-        if headers then
-            for k, v in pairs(headers) do
-                out[k] = v
-            end
-        end
+
+        local out = headers and table.clone(headers) or {}
+
         if with_headers then
             out["RateLimit-Limit"] = tostring(info.limit)
             out["RateLimit-Remaining"] = tostring(info.remaining)
             out["RateLimit-Reset"] = tostring(info.reset)
         end
+
         if info.refused then
             out["Retry-After"] = tostring(info.retry_after)
         end
+
         return status, payload, out
     end)
 end
